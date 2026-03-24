@@ -1,6 +1,6 @@
 """
 MADIS 1-Minute ASOS Parser for NowCast
-Uses netCDF4 library for proper parsing
+LOW reversal detection using 1-minute data
 """
 
 import os
@@ -19,24 +19,24 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 
 STATIONS = {
-    'KLGA': {'city': 'New York'},
-    'KMIA': {'city': 'Miami'},
-    'KLAX': {'city': 'Los Angeles'},
-    'KAUS': {'city': 'Austin'},
-    'KMDW': {'city': 'Chicago'},
-    'KDEN': {'city': 'Denver'},
-    'KPHL': {'city': 'Philadelphia'},
-    'KIAH': {'city': 'Houston'},
-    'KLAS': {'city': 'Las Vegas'},
-    'KSEA': {'city': 'Seattle'},
-    'KSFO': {'city': 'San Francisco'},
-    'KDCA': {'city': 'Washington DC'},
-    'KMSY': {'city': 'New Orleans'},
-    'KPHX': {'city': 'Phoenix'},
-    'KATL': {'city': 'Atlanta'},
-    'KMSP': {'city': 'Minneapolis'},
-    'KBOS': {'city': 'Boston'},
-    'KOKC': {'city': 'Oklahoma City'},
+    'KLGA': {'city': 'New York',       'tz': 'America/New_York',    'tz_offset': -4},
+    'KMIA': {'city': 'Miami',          'tz': 'America/New_York',    'tz_offset': -4},
+    'KLAX': {'city': 'Los Angeles',    'tz': 'America/Los_Angeles', 'tz_offset': -7},
+    'KAUS': {'city': 'Austin',         'tz': 'America/Chicago',     'tz_offset': -5},
+    'KMDW': {'city': 'Chicago',        'tz': 'America/Chicago',     'tz_offset': -5},
+    'KDEN': {'city': 'Denver',         'tz': 'America/Denver',      'tz_offset': -6},
+    'KPHL': {'city': 'Philadelphia',   'tz': 'America/New_York',    'tz_offset': -4},
+    'KIAH': {'city': 'Houston',        'tz': 'America/Chicago',     'tz_offset': -5},
+    'KLAS': {'city': 'Las Vegas',      'tz': 'America/Los_Angeles', 'tz_offset': -7},
+    'KSEA': {'city': 'Seattle',        'tz': 'America/Los_Angeles', 'tz_offset': -7},
+    'KSFO': {'city': 'San Francisco',  'tz': 'America/Los_Angeles', 'tz_offset': -7},
+    'KDCA': {'city': 'Washington DC',  'tz': 'America/New_York',    'tz_offset': -4},
+    'KMSY': {'city': 'New Orleans',    'tz': 'America/Chicago',     'tz_offset': -5},
+    'KPHX': {'city': 'Phoenix',        'tz': 'America/Phoenix',     'tz_offset': -7},
+    'KATL': {'city': 'Atlanta',        'tz': 'America/New_York',    'tz_offset': -4},
+    'KMSP': {'city': 'Minneapolis',    'tz': 'America/Chicago',     'tz_offset': -5},
+    'KBOS': {'city': 'Boston',         'tz': 'America/New_York',    'tz_offset': -4},
+    'KOKC': {'city': 'Oklahoma City',  'tz': 'America/Chicago',     'tz_offset': -5},
 }
 
 MADIS_BASE = 'https://madis-data.ncep.noaa.gov/madisPublic1/data/LDAD/hfmetar/netCDF/'
@@ -44,16 +44,68 @@ MADIS_BASE = 'https://madis-data.ncep.noaa.gov/madisPublic1/data/LDAD/hfmetar/ne
 live_data = {}
 last_updated = None
 
-
 def c_to_f(c):
     return round(float(c) * 9/5 + 32, 1)
 
 def k_to_f(k):
     return round((float(k) - 273.15) * 9/5 + 32, 1)
 
+def detect_low_reversal(readings_with_time):
+    """
+    Detect LOW reversal from list of (tempF, utc_epoch) tuples sorted oldest→newest.
+    Returns: {
+        trueLowF, trueLowTime (ISO), trueLowConfirmed,
+        reversalTempF, reversalTime (ISO)
+    }
+    Confirmed = 3 consecutive readings rising after the bottom.
+    """
+    if not readings_with_time:
+        return None
+
+    # Find the minimum temp and its index
+    min_temp = None
+    min_idx = 0
+    for i, (t, _) in enumerate(readings_with_time):
+        if min_temp is None or t < min_temp:
+            min_temp = t
+            min_idx = i
+
+    min_time = readings_with_time[min_idx][1]
+
+    # Check for 3 consecutive rising readings after the minimum
+    confirmed = False
+    reversal_temp = None
+    reversal_time = None
+
+    after_min = readings_with_time[min_idx+1:]
+    consecutive_rises = 0
+    prev_temp = min_temp
+
+    for temp, ts in after_min:
+        if temp > prev_temp:
+            consecutive_rises += 1
+            if consecutive_rises >= 3:
+                confirmed = True
+                reversal_temp = temp
+                reversal_time = ts
+                break
+        else:
+            consecutive_rises = 0
+        prev_temp = temp
+
+    return {
+        'trueLowF': round(min_temp),
+        'trueLowTempRaw': min_temp,
+        'trueLowTime': datetime.fromtimestamp(min_time, tz=timezone.utc).isoformat() if min_time else None,
+        'trueLowConfirmed': confirmed,
+        'reversalTempF': round(reversal_temp) if reversal_temp else None,
+        'reversalTime': datetime.fromtimestamp(reversal_time, tz=timezone.utc).isoformat() if reversal_time else None,
+        'readingCount': len(readings_with_time),
+    }
+
 
 def parse_madis_netcdf(filepath):
-    """Parse a MADIS HFMETAR netCDF file and return {station: [tempF]} dict"""
+    """Parse MADIS HFMETAR netCDF — returns {station: [(tempF, obs_epoch)]}"""
     import netCDF4 as nc
     import numpy as np
 
@@ -61,47 +113,28 @@ def parse_madis_netcdf(filepath):
     try:
         ds = nc.Dataset(filepath, 'r')
 
-        # Log available variables on first parse
-        log.info(f"NetCDF vars: {list(ds.variables.keys())}")
-
-        # Get station IDs
-        station_var = None
-        for vname in ['stationId', 'stationName', 'station_id', 'wmoStaNum', 'stationIDchar']:
-            if vname in ds.variables:
-                station_var = vname
-                break
-
-        # Get temperature variable
-        temp_var = None
-        for vname in ['temperature', 'airTemperature', 'temp', 'T', 'air_temp', 'Temperature']:
-            if vname in ds.variables:
-                temp_var = vname
-                break
-
-        log.info(f"Using station_var={station_var} temp_var={temp_var}")
+        station_var = next((v for v in ['stationId','stationName','station_id'] if v in ds.variables), None)
+        temp_var = next((v for v in ['temperature','airTemperature','temp'] if v in ds.variables), None)
+        time_var = next((v for v in ['observationTime','obsTime','time'] if v in ds.variables), None)
 
         if not station_var or not temp_var:
-            log.warning(f"Missing variables. Available: {list(ds.variables.keys())}")
             ds.close()
             return results
 
-        # Read station IDs
         raw_ids = ds.variables[station_var][:]
         temps = ds.variables[temp_var][:]
+        times = ds.variables[time_var][:] if time_var else None
 
-        # Handle masked arrays
         if hasattr(temps, 'data'):
             temps_data = temps.data
-            temps_mask = temps.mask if hasattr(temps, 'mask') else np.zeros_like(temps_data, dtype=bool)
+            temps_mask = temps.mask if hasattr(temps, 'mask') and np.ndim(temps.mask) > 0 else None
         else:
             temps_data = np.array(temps)
-            temps_mask = np.zeros_like(temps_data, dtype=bool)
+            temps_mask = None
 
-        # Decode station IDs
         nrecs = raw_ids.shape[0]
         for i in range(nrecs):
             try:
-                # Station ID can be char array or string
                 raw = raw_ids[i]
                 if hasattr(raw, 'tobytes'):
                     sid = raw.tobytes().decode('ascii', errors='replace').strip('\x00').strip()
@@ -113,16 +146,13 @@ def parse_madis_netcdf(filepath):
                 if not sid or sid not in STATIONS:
                     continue
 
-                # Get temperature
-                if temps_mask is not None and np.ndim(temps_mask) > 0:
-                    if temps_mask[i]:
-                        continue
-                
+                if temps_mask is not None and temps_mask[i]:
+                    continue
+
                 tempK = float(temps_data[i])
                 if abs(tempK) > 1e10 or tempK != tempK:
                     continue
 
-                # Convert to F
                 if 200 <= tempK <= 350:
                     tempF = k_to_f(tempK)
                 elif -60 <= tempK <= 60:
@@ -130,16 +160,24 @@ def parse_madis_netcdf(filepath):
                 else:
                     continue
 
-                if -60 <= tempF <= 140:
-                    if sid not in results:
-                        results[sid] = []
-                    results[sid].append(tempF)
+                if not (-60 <= tempF <= 140):
+                    continue
 
-            except Exception as e:
+                obs_epoch = None
+                if times is not None:
+                    try:
+                        obs_epoch = float(times[i])
+                    except:
+                        pass
+
+                if sid not in results:
+                    results[sid] = []
+                results[sid].append((tempF, obs_epoch))
+
+            except:
                 continue
 
         ds.close()
-        log.info(f"Parsed {sum(len(v) for v in results.values())} readings for {len(results)} stations")
 
     except Exception as e:
         log.error(f"netCDF4 parse error: {e}")
@@ -173,7 +211,6 @@ def fetch_and_parse():
             with urllib.request.urlopen(req, timeout=15) as resp:
                 gz_data = resp.read()
 
-            # Decompress to temp file (netCDF4 needs a file path)
             with tempfile.NamedTemporaryFile(suffix='.nc', delete=False) as tmp:
                 tmp.write(gzip.decompress(gz_data))
                 tmp_path = tmp.name
@@ -181,8 +218,8 @@ def fetch_and_parse():
             obs = parse_madis_netcdf(tmp_path)
             os.unlink(tmp_path)
 
-            for sta, temps in obs.items():
-                station_readings[sta].extend(temps)
+            for sta, readings in obs.items():
+                station_readings[sta].extend(readings)
             fetched += 1
 
         except urllib.error.HTTPError as e:
@@ -192,24 +229,41 @@ def fetch_and_parse():
             log.warning(f"{fname}: {e}")
 
     log.info(f"Fetched {fetched} files")
-    for sta, readings in station_readings.items():
-        if readings:
-            log.info(f"{sta}: {len(readings)} readings low={min(readings):.1f} high={max(readings):.1f} current={readings[-1]:.1f}")
 
     result = {}
     now_utc = datetime.now(timezone.utc)
+
     for sta, meta in STATIONS.items():
         readings = station_readings[sta]
+
         if readings:
+            # Sort by time
+            readings_sorted = sorted(readings, key=lambda x: x[1] if x[1] else 0)
+            temps_only = [r[0] for r in readings_sorted]
+
+            current = temps_only[-1] if temps_only else None
+            true_high = max(temps_only)
+            true_low_raw = min(temps_only)
+
+            # LOW reversal detection
+            low_reversal = detect_low_reversal(readings_sorted)
+
             result[sta] = {
                 'station': sta,
                 'city': meta['city'],
-                'currentTempF': readings[-1],
-                'trueLowF': min(readings),
-                'trueHighF': max(readings),
+                'currentTempF': round(current) if current else None,
+                'currentTempRaw': current,
+                'trueLowF': round(true_low_raw),
+                'trueLowRaw': true_low_raw,
+                'trueHighF': round(true_high),
+                'trueHighRaw': true_high,
                 'readingCount': len(readings),
                 'fetchedAt': now_utc.isoformat(),
+                'lowReversal': low_reversal,
             }
+
+            if low_reversal:
+                log.info(f"{sta}: low={true_low_raw:.1f}F high={true_high:.1f}F confirmed={low_reversal['trueLowConfirmed']}")
         else:
             result[sta] = {
                 'station': sta,
@@ -220,6 +274,7 @@ def fetch_and_parse():
                 'readingCount': 0,
                 'fetchedAt': now_utc.isoformat(),
                 'error': 'No data',
+                'lowReversal': None,
             }
 
     live_data = result
@@ -236,7 +291,6 @@ def background_loop():
         time.sleep(300)
 
 
-# Start at module level for gunicorn
 t = threading.Thread(target=background_loop, daemon=True)
 t.start()
 
