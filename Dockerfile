@@ -7,8 +7,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements_full.txt .
+COPY . .
 RUN pip install flask gunicorn netCDF4 numpy
 
-COPY madis_parser.py .
 CMD gunicorn madis_parser:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
