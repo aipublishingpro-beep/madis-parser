@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 
 STATIONS = {
-    'KNYC': {'city': 'New York'},
+    'KLGA': {'city': 'New York'},
     'KMIA': {'city': 'Miami'},
     'KLAX': {'city': 'Los Angeles'},
     'KAUS': {'city': 'Austin'},
